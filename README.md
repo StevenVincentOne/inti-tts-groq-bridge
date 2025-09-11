@@ -114,10 +114,28 @@ Expected response:
 
 ## Docker Deployment
 
-### Build Image
+### 🐳 Docker Hub Image
+
+**Production Image**: `intellipedia/inti-tts-groq-bridge:v1.0` (available on Docker Hub)
+
+### Quick Start with Docker Hub
 
 ```bash
-docker build -t intellipedia/inti-tts-groq-bridge:latest .
+# Pull and run from Docker Hub
+docker run -d \
+  --name tts-bridge \
+  -p 8080:8080 \
+  -e GROQ_API_KEY="your_api_key" \
+  intellipedia/inti-tts-groq-bridge:v1.0
+```
+
+### Build from Source
+
+```bash
+# Clone repository and build locally
+git clone https://github.com/StevenVincentOne/inti-tts-groq-bridge.git
+cd inti-tts-groq-bridge
+docker build -t inti-tts-groq-bridge:latest .
 ```
 
 ### Run Container
@@ -127,7 +145,7 @@ docker run -d \
   --name tts-bridge \
   -p 8080:8080 \
   -e GROQ_API_KEY="your_api_key" \
-  intellipedia/inti-tts-groq-bridge:latest
+  inti-tts-groq-bridge:latest
 ```
 
 ### Docker Swarm Deployment
