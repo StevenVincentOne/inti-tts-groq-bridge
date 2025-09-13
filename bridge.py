@@ -22,9 +22,13 @@ import json
 import logging
 import base64
 import os
+import io
+import wave
 from typing import Optional, Dict, Any
 import websockets
 import aiohttp
+import numpy as np
+import msgpack
 from websockets.server import WebSocketServerProtocol
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
@@ -138,7 +142,8 @@ class TTSBridge:
             "model": GROQ_TTS_MODEL,
             "input": text,
             "voice": GROQ_TTS_VOICE,
-            "response_format": "mp3"  # Groq supports mp3, wav, flac, opus
+            # Request WAV to easily extract PCM for Unmute (msgpack floats)
+            "response_format": "wav"
         }
         
         headers = {
@@ -171,29 +176,47 @@ class TTSBridge:
             logger.error(f"TTS API call failed: {e}")
             return None
     
+    def wav_bytes_to_pcm_f32(self, wav_bytes: bytes) -> np.ndarray:
+        """Convert 16-bit PCM WAV bytes to float32 mono PCM in [-1, 1]."""
+        with wave.open(io.BytesIO(wav_bytes), 'rb') as wf:
+            n_channels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            framerate = wf.getframerate()
+            n_frames = wf.getnframes()
+            raw = wf.readframes(n_frames)
+
+        if sampwidth != 2:
+            logger.warning(f"Unexpected sample width {sampwidth*8} bits; attempting to decode as 16-bit")
+        pcm = np.frombuffer(raw, dtype='<i2').astype(np.float32)
+        if n_channels > 1:
+            pcm = pcm.reshape(-1, n_channels).mean(axis=1)
+        # Normalize to [-1, 1]
+        pcm = pcm / 32768.0
+        return pcm
+
     async def stream_audio_chunks(self, websocket: WebSocketServerProtocol, audio_data: bytes):
-        """
-        Stream audio data back to client in chunks to simulate real-time streaming.
-        
-        Args:
-            websocket: WebSocket connection
-            audio_data: Complete audio bytes to stream
-        """
-        # Convert to base64 for JSON transmission
-        audio_b64 = base64.b64encode(audio_data).decode('utf-8')
-        
-        # For now, send as single chunk. Future: implement chunked streaming
-        response = {
-            "type": "audio",
-            "audio_data": audio_b64,
-            "format": "mp3"
-        }
-        
+        """Stream audio as msgpack TTSAudioMessage frames (floats)."""
         try:
-            await websocket.send(json.dumps(response))
-            logger.info(f"Streamed audio: {len(audio_b64)} base64 chars")
+            pcm = self.wav_bytes_to_pcm_f32(audio_data)
         except Exception as e:
-            logger.error(f"Failed to stream audio: {e}")
+            logger.error(f"Failed to parse WAV: {e}
+")
+            return
+
+        # Chunk into ~80ms at 24kHz (1920 samples). If SR differs, still chunk by 1920.
+        CHUNK = 1920
+        total = pcm.shape[0]
+        sent = 0
+        while sent < total:
+            chunk = pcm[sent:sent+CHUNK]
+            if chunk.size == 0:
+                break
+            payload = {"type": "Audio", "pcm": chunk.tolist()}
+            await websocket.send(msgpack.packb(payload))
+            sent += chunk.size
+            # small pacing to simulate real-time
+            await asyncio.sleep(0.08)
+        logger.info(f"Streamed {sent} samples as msgpack TTSAudioMessage")
     
     async def handle_text_message(self, websocket: WebSocketServerProtocol, message_data: Dict[str, Any]):
         """
@@ -214,7 +237,7 @@ class TTSBridge:
         audio_data = await self.synthesize_text(text)
         
         if audio_data:
-            # Stream audio back to client
+            # Stream audio back to client using msgpack TTSAudioMessage
             await self.stream_audio_chunks(websocket, audio_data)
         else:
             await self.send_error(websocket, "TTS synthesis failed")
@@ -232,10 +255,9 @@ class TTSBridge:
             logger.error(f"Failed to send error message: {e}")
     
     async def send_ready_message(self, websocket: WebSocketServerProtocol):
-        """Send ready message for ServiceWithStartup protocol."""
-        ready_message = {"type": "ready"}
-        await websocket.send(json.dumps(ready_message))
-        logger.info("Sent ready message to Unmute service discovery")
+        """Send msgpack Ready for ServiceWithStartup (Unmute expects msgpack)."""
+        await websocket.send(msgpack.packb({"type": "Ready"}))
+        logger.info("Sent msgpack Ready to Unmute")
     
     async def send_capacity_error(self, websocket: WebSocketServerProtocol):
         """Send capacity error for ServiceWithStartup protocol."""
@@ -278,7 +300,7 @@ class TTSBridge:
                 await self.send_error(websocket, "TTS API unavailable")
                 return
             
-            # Send ready message to complete startup handshake
+            # Send Ready in msgpack to complete startup handshake
             await self.send_ready_message(websocket)
             
             # Increment active session count
@@ -288,23 +310,28 @@ class TTSBridge:
             # Handle TTS requests
             async for message in websocket:
                 try:
-                    # Parse JSON message
-                    if isinstance(message, str):
+                    # Unmute sends msgpack client messages: {type: "Text"|"Voice"|"Eos", ...}
+                    if isinstance(message, (bytes, bytearray)):
+                        data = msgpack.unpackb(message)
+                        mtype = data.get("type")
+                        if mtype == "Text":
+                            await self.handle_text_message(websocket, data)
+                        elif mtype == "Eos":
+                            logger.info("Received Eos; no more text to synthesize")
+                        else:
+                            logger.warning(f"Unknown msgpack message type: {mtype}")
+                            await self.send_error(websocket, "Invalid message format")
+                    elif isinstance(message, str):
+                        # Fallback: accept simple JSON for manual tests
                         message_data = json.loads(message)
-                        
-                        # Handle text synthesis request
                         if "text" in message_data:
                             await self.handle_text_message(websocket, message_data)
                         else:
-                            logger.warning(f"Unknown message format: {message_data}")
+                            logger.warning(f"Unknown JSON message: {message_data}")
                             await self.send_error(websocket, "Invalid message format")
                     else:
-                        logger.warning(f"Received non-text message: {type(message)}")
-                        await self.send_error(websocket, "Text messages only")
-                        
-                except json.JSONDecodeError as e:
-                    logger.error(f"JSON decode error: {e}")
-                    await self.send_error(websocket, "Invalid JSON")
+                        logger.warning(f"Unsupported message type: {type(message)}")
+                        await self.send_error(websocket, "Invalid message type")
                 except Exception as e:
                     logger.error(f"Message handling error: {e}")
                     await self.send_error(websocket, "Message processing failed")
