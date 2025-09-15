@@ -226,8 +226,8 @@ class TTSBridge:
             except Exception as e:
                 logger.warning(f"Resample failed ({sr} -> {TARGET_SR}), streaming original SR: {e}")
 
-        # Chunk into ~80ms at 24kHz (1920 samples).
-        CHUNK = 1920
+        # Chunk into ~20ms at 24kHz (480 samples) for smoother streaming
+        CHUNK = 480  # Reduced from 1920 for smoother audio
         total = pcm.shape[0]
         sent = 0
         while sent < total:
@@ -237,8 +237,8 @@ class TTSBridge:
             payload = {"type": "Audio", "pcm": chunk.tolist()}
             await websocket.send(msgpack.packb(payload))
             sent += chunk.size
-            # small pacing to simulate real-time
-            await asyncio.sleep(0.08)
+            # Faster pacing for smoother audio (20ms instead of 80ms)
+            await asyncio.sleep(0.02)
         logger.info(f"Streamed {sent} samples as msgpack TTSAudioMessage")
     
     async def handle_text_message(self, websocket: WebSocketServerProtocol, message_data: Dict[str, Any]):
