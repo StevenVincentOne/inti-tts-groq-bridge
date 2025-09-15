@@ -29,6 +29,8 @@ import websockets
 import aiohttp
 import numpy as np
 import msgpack
+import socket
+from aiohttp import TCPConnector
 from websockets.server import WebSocketServerProtocol
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
@@ -72,8 +74,10 @@ class TTSBridge:
         """Initialize HTTP session for Groq API calls."""
         if not self.session:
             timeout = aiohttp.ClientTimeout(total=30)
-            self.session = aiohttp.ClientSession(timeout=timeout)
-            logger.info("HTTP session initialized for Groq API")
+            # Force IPv4-only connections to prevent IPv6 connectivity issues
+            connector = TCPConnector(family=socket.AF_INET)
+            self.session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+            logger.info("HTTP session initialized for Groq API with IPv4-only connections")
     
     async def close_session(self):
         """Close HTTP session."""
@@ -143,7 +147,8 @@ class TTSBridge:
             "input": text,
             "voice": GROQ_TTS_VOICE,
             # Request WAV to easily extract PCM for Unmute (msgpack floats)
-            "response_format": "wav"
+            # OpenAI-compatible TTS expects key 'format' rather than 'response_format'
+            "format": "wav"
         }
         
         headers = {
@@ -176,8 +181,11 @@ class TTSBridge:
             logger.error(f"TTS API call failed: {e}")
             return None
     
-    def wav_bytes_to_pcm_f32(self, wav_bytes: bytes) -> np.ndarray:
-        """Convert 16-bit PCM WAV bytes to float32 mono PCM in [-1, 1]."""
+    def wav_bytes_to_pcm_f32(self, wav_bytes: bytes) -> tuple[np.ndarray, int]:
+        """Convert 16-bit PCM WAV bytes to float32 mono PCM in [-1, 1].
+
+        Returns (pcm, sample_rate)
+        """
         with wave.open(io.BytesIO(wav_bytes), 'rb') as wf:
             n_channels = wf.getnchannels()
             sampwidth = wf.getsampwidth()
@@ -192,18 +200,33 @@ class TTSBridge:
             pcm = pcm.reshape(-1, n_channels).mean(axis=1)
         # Normalize to [-1, 1]
         pcm = pcm / 32768.0
-        return pcm
+        return pcm, framerate
 
     async def stream_audio_chunks(self, websocket: WebSocketServerProtocol, audio_data: bytes):
-        """Stream audio as msgpack TTSAudioMessage frames (floats)."""
+        """Stream audio as msgpack TTSAudioMessage frames (floats).
+
+        Ensures 24 kHz PCM by resampling if needed.
+        """
         try:
-            pcm = self.wav_bytes_to_pcm_f32(audio_data)
+            pcm, sr = self.wav_bytes_to_pcm_f32(audio_data)
         except Exception as e:
-            logger.error(f"Failed to parse WAV: {e}
-")
+            logger.error(f"Failed to parse WAV: {e}")
             return
 
-        # Chunk into ~80ms at 24kHz (1920 samples). If SR differs, still chunk by 1920.
+        # Resample to 24 kHz if necessary (naive linear interpolation)
+        TARGET_SR = 24000
+        if sr != TARGET_SR and pcm.size > 0:
+            try:
+                import numpy as _np
+                x_old = _np.linspace(0.0, 1.0, pcm.size, endpoint=False)
+                new_size = int(round(pcm.size * (TARGET_SR / float(sr))))
+                x_new = _np.linspace(0.0, 1.0, new_size, endpoint=False)
+                pcm = _np.interp(x_new, x_old, pcm).astype(_np.float32)
+                logger.info(f"Resampled TTS audio from {sr} Hz to {TARGET_SR} Hz ({pcm.size} samples)")
+            except Exception as e:
+                logger.warning(f"Resample failed ({sr} -> {TARGET_SR}), streaming original SR: {e}")
+
+        # Chunk into ~80ms at 24kHz (1920 samples).
         CHUNK = 1920
         total = pcm.shape[0]
         sent = 0
@@ -243,13 +266,10 @@ class TTSBridge:
             await self.send_error(websocket, "TTS synthesis failed")
     
     async def send_error(self, websocket: WebSocketServerProtocol, message: str):
-        """Send error response to client."""
-        error_response = {
-            "type": "error",
-            "message": message
-        }
+        """Send error response to client as msgpack with expected schema."""
+        error_response = {"type": "Error", "message": message}
         try:
-            await websocket.send(json.dumps(error_response))
+            await websocket.send(msgpack.packb(error_response))
             logger.info(f"Sent error: {message}")
         except Exception as e:
             logger.error(f"Failed to send error message: {e}")
@@ -261,11 +281,8 @@ class TTSBridge:
     
     async def send_capacity_error(self, websocket: WebSocketServerProtocol):
         """Send capacity error for ServiceWithStartup protocol."""
-        error_message = {
-            "type": "error", 
-            "message": "Service at capacity"
-        }
-        await websocket.send(json.dumps(error_message))
+        error_message = {"type": "Error", "message": "Service at capacity"}
+        await websocket.send(msgpack.packb(error_message))
         logger.warning(f"Sent capacity error - active sessions: {self.active_sessions}/{MAX_CONCURRENT_SESSIONS}")
     
     async def handle_websocket_connection(self, websocket: WebSocketServerProtocol, path: str):
