@@ -101,7 +101,7 @@ class TTSBridge:
             "model": GROQ_TTS_MODEL,
             "input": "test",
             "voice": GROQ_TTS_VOICE,
-            "response_format": "mp3"
+            "response_format": "wav"
         }
         
         headers = {
@@ -147,8 +147,8 @@ class TTSBridge:
             "input": text,
             "voice": GROQ_TTS_VOICE,
             # Request WAV to easily extract PCM for Unmute (msgpack floats)
-            # OpenAI-compatible TTS expects key 'format' rather than 'response_format'
-            "format": "wav"
+            # Groq API expects 'response_format' (OpenAI-compatible)
+            "response_format": "wav"
         }
         
         headers = {
